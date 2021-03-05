@@ -39,7 +39,7 @@ public final class CarouselView: UIView {
         public static let `default` = SnapBehavior.hard
     }
     
-    public struct Transform {
+    public struct Transform: Equatable {
         public init(alpha: CGFloat, sizeRatio: CGFloat) {
             self.alpha = alpha
             self.sizeRatio = sizeRatio
@@ -49,7 +49,7 @@ public final class CarouselView: UIView {
         public let sizeRatio: CGFloat
     }
     
-    public struct Appearance {
+    public struct Appearance: Equatable {
         public init(sideItemTransform: CarouselView.Transform = Transform(alpha: 1, sizeRatio: 0.88), centerItemWidthPercentage: CGFloat = 0.63, itemSpacing: CGFloat = 10, additionalInsets: UIEdgeInsets = .zero) {
             self.sideItemTransform = sideItemTransform
             self.centerItemWidthPercentage = centerItemWidthPercentage
@@ -70,12 +70,14 @@ public final class CarouselView: UIView {
     
     public var appearance = Appearance() {
         didSet {
+            guard oldValue != appearance else { return }
             reloadData()
         }
     }
     
     public weak var dataSource: CarouselViewDataSource? {
         didSet {
+            guard oldValue !== dataSource else { return }
             reloadData()
         }
     }
@@ -85,8 +87,8 @@ public final class CarouselView: UIView {
     public var preloadDistance: CGFloat = 80
     
     public var adjustedContentInset: UIEdgeInsets {
-        let centerCellWidth = (scrollView.bounds.size.width * appearance.centerItemWidthPercentage)
-        let sideInset = ((scrollView.bounds.size.width - centerCellWidth) / 2).rounded()
+        let centerCellWidth = (scrollView.visibleSize.width * appearance.centerItemWidthPercentage)
+        let sideInset = ((scrollView.visibleSize.width - centerCellWidth) / 2).rounded()
         
         return UIEdgeInsets(top: appearance.additionalInsets.top,
                             left: sideInset + appearance.additionalInsets.left,
@@ -119,15 +121,23 @@ public final class CarouselView: UIView {
     }
     
     public func reloadData() {
-        contentView.subviews.forEach { $0.removeFromSuperview() }
+        // if snap behavior was on, store currently centered item to restore it after data reload
+        let centerItemIndex: Int? = (snapBehavior != .none) ? self.centerItemIndex : nil
+        
+        contentView.subviews.forEach { removeView($0) }
 
         calculateItemFrames()
-        contentWidthConstraint.constant = getContentRect().width
+        contentWidthConstraint.constant = getApproximateContentRect().width
         
         let items = addItems()
         self.visibleItems = items
         
+        layoutIfNeeded()
         updateTransforms()
+        
+        if let centerItemIndex = centerItemIndex {
+            scrollToItem(at: centerItemIndex, animated: false)
+        }
     }
     
     public func scrollToItem(at index: Int, animated: Bool = true) {
@@ -176,7 +186,7 @@ public final class CarouselView: UIView {
         // Treat all items as "small" ones by default
         // actaully in this approach we only "enlarge" center item instead of transforming the other ones
         let spacing = (appearance.itemSpacing / appearance.sideItemTransform.sizeRatio).rounded()
-        let itemWidth = (scrollView.bounds.size.width * appearance.centerItemWidthPercentage * appearance.sideItemTransform.sizeRatio).rounded()
+        let itemWidth = (scrollView.visibleSize.width * appearance.centerItemWidthPercentage * appearance.sideItemTransform.sizeRatio).rounded()
         
         var insets = adjustedContentInset
         insets.left = ((insets.left + appearance.itemSpacing) / appearance.sideItemTransform.sizeRatio).rounded()
@@ -187,13 +197,13 @@ public final class CarouselView: UIView {
             CGRect(x: (itemWidth + spacing) * CGFloat(itemIndex) + insets.left,
                    y: 0,
                    width: itemWidth,
-                   height: scrollView.bounds.size.height - insets.top - insets.bottom)
+                   height: scrollView.visibleSize.height - insets.top - insets.bottom)
         }
         
         return itemFrames
     }
     
-    private func getContentRect(from frames: [CGRect]? = nil) -> CGRect {
+    private func getApproximateContentRect(from frames: [CGRect]? = nil) -> CGRect {
         let frames = frames ?? itemFrames
         var contentBounds = frames.reduce(CGRect.zero) { result, rect in result.union(rect) }
         
@@ -247,23 +257,42 @@ public final class CarouselView: UIView {
             let frame = itemFrames[index]
             
             let recognizer = UITapGestureRecognizer(target: self, action: #selector(itemTapped))
-            recognizer.name = "carouselTapRecognizer#\(index)"
+            recognizer.name = "carouselView#tapRecognizer#\(index)"
             recognizer.delegate = self
             view.addGestureRecognizer(recognizer)
             
             contentView.addSubview(view)
             view.translatesAutoresizingMaskIntoConstraints = false
             let left = view.leftAnchor.constraint(equalTo: contentView.leftAnchor, constant: frame.minX)
+            left.identifier = "carouselView#leftConstraint"
             let top = view.topAnchor.constraint(equalTo: contentView.topAnchor, constant: frame.minY)
+            top.identifier = "carouselView#topConstraint"
             let width = view.widthAnchor.constraint(equalToConstant: frame.width)
+            width.identifier = "carouselView#widthConstraint"
             let height = view.heightAnchor.constraint(equalToConstant: frame.height)
+            height.identifier = "carouselView#heightConstraint"
             
             NSLayoutConstraint.activate([left, top, width, height])
             
             result.append(VisibleItem(index: index, view: view))
         }
         
+        contentView.layoutIfNeeded()
+        
         return result
+    }
+    
+    private func removeView(_ view: UIView) {
+        view.removeFromSuperview()
+        
+        if let tapRecognizer = view.gestureRecognizers?
+            .first(where: { $0.name?.hasPrefix("carouselTapRecognizer") == true }) {
+            view.removeGestureRecognizer(tapRecognizer)
+        }
+        
+        view.constraints
+            .filter { $0.identifier?.hasPrefix("carouselView") == true }
+            .forEach { $0.isActive = false }
     }
     
     @objc private func itemTapped(_ recognizer: UITapGestureRecognizer) {
@@ -279,7 +308,7 @@ public final class CarouselView: UIView {
         let indicesToRemove = itemsToRemove.map(\.index)
         let indicesToAdd = visibleItemIndices.filter { idx in !self.visibleItems.contains { $0.index == idx } }
         
-        itemsToRemove.forEach { $0.view?.removeFromSuperview() }
+        itemsToRemove.compactMap(\.view).forEach { removeView($0) }
         let remainingItems = self.visibleItems.filter { !indicesToRemove.contains($0.index) }
         let addedItems = addItems(at: indicesToAdd)
         
@@ -304,16 +333,25 @@ public final class CarouselView: UIView {
                                             xScale: sideItemTransform.xScale * sideToOffscreenRatio,
                                             yScale: sideItemTransform.yScale * sideToOffscreenRatio)
         
-        visibleItems.forEach { item in
+        // bring centermost items to front
+        visibleItems
+            .compactMap(\.view)
+            .sorted { abs(centerOffset -  $0.frame.midX) > abs(centerOffset -  $1.frame.midX) }
+            .forEach { contentView.bringSubviewToFront($0) }
+        
+        visibleItems.enumerated().forEach { (index, item) in
             guard let view = item.view else { return }
             
-            let distanceFromCenter = abs(view.frame.midX - centerOffset)
-            let distanceRatio = distanceFromCenter / offscreenDistance
+            let distanceFromCenter = centerOffset - view.frame.midX
+            let distanceRatio = abs(distanceFromCenter) / offscreenDistance
             
             let transform = TransformValues.get(from: centerTransform,
                                                 to: edgeTransform,
                                                 progress: distanceRatio)
-            view.apply(transform)
+            
+            view.alpha = transform.alpha
+            view.transform = CGAffineTransform(scaleX: transform.xScale,
+                                               y: transform.yScale)
         }
     }
 }
@@ -372,12 +410,6 @@ extension CarouselView: UIScrollViewDelegate {
 }
 
 private extension UIView {
-    func apply(_ transform: TransformValues) {
-        self.alpha = transform.alpha
-        self.transform = CGAffineTransform(scaleX: transform.xScale,
-                                           y: transform.yScale)
-    }
-    
     @discardableResult
     func constraintToEdges(of view: UIView) -> EdgeConstraints {
         translatesAutoresizingMaskIntoConstraints = false
