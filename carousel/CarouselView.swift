@@ -3,8 +3,12 @@
 //  dietbyann
 //
 //  Created by Paweł Wojtkowiak on 04/03/2021.
-//  Copyright © 2021 DietLabs. All rights reserved.
+//  Copyright © 2021 VAPOR Paweł Wojtkowiak. All rights reserved.
 //
+
+// TODO:
+// - smooth infinite scrolling for .soft and .none snap behaviors
+// - for non-infinite, scrollview bounce works bad for last cell
 
 import UIKit
 
@@ -45,32 +49,38 @@ public final class CarouselView: UIView {
             self.sizeRatio = sizeRatio
         }
         
-        public let alpha: CGFloat
-        public let sizeRatio: CGFloat
+        public var alpha: CGFloat
+        public var sizeRatio: CGFloat
+    }
+    
+    public enum CenterItemWidth: Equatable {
+        case contentWidthRatio(CGFloat)
+        case heightRatio(CGFloat)
     }
     
     public struct Appearance: Equatable {
-        public init(sideItemTransform: CarouselView.Transform = Transform(alpha: 1, sizeRatio: 0.88), centerItemWidthPercentage: CGFloat = 0.63, itemSpacing: CGFloat = 10, additionalInsets: UIEdgeInsets = .zero) {
+        public init(sideItemTransform: CarouselView.Transform = Transform(alpha: 1, sizeRatio: 0.88), centerItemWidth: CenterItemWidth = .contentWidthRatio(0.63), itemSpacing: CGFloat = 10, additionalInsets: UIEdgeInsets = .zero) {
             self.sideItemTransform = sideItemTransform
-            self.centerItemWidthPercentage = centerItemWidthPercentage
+            self.centerItemWidth = centerItemWidth
             self.itemSpacing = itemSpacing
             self.additionalInsets = additionalInsets
         }
         
         public var sideItemTransform = Transform(alpha: 1, sizeRatio: 0.88)
-        public var centerItemWidthPercentage: CGFloat = 0.63
+        public var centerItemWidth: CenterItemWidth = .contentWidthRatio(0.63)
         public var itemSpacing: CGFloat = 10
         public var additionalInsets: UIEdgeInsets = .zero
     }
     
     public struct VisibleItem {
         public let index: Int
+        public let actualIndex: Int
         public weak var view: UIView!
     }
     
     public var appearance = Appearance() {
         didSet {
-            guard oldValue != appearance else { return }
+            guard oldValue != appearance, reloadDataOnAppearanceUpdate else { return }
             reloadData()
         }
     }
@@ -82,28 +92,35 @@ public final class CarouselView: UIView {
         }
     }
     
+    public var isInfinite: Bool = true {
+        didSet {
+            guard oldValue != isInfinite else { return }
+            reloadData()
+        }
+    }
+    
     public weak var delegate: CarouselViewDelegate?
     
     public var preloadDistance: CGFloat = 80
     
     public var adjustedContentInset: UIEdgeInsets {
-        let centerCellWidth = (scrollView.visibleSize.width * appearance.centerItemWidthPercentage)
-        let sideInset = ((scrollView.visibleSize.width - centerCellWidth) / 2).rounded()
+        let sideInset = ((scrollView.visibleSize.width - centerItemSize.width) / 2).rounded()
+        let actualSideInset = isInfinite ? 0 : (sideInset + appearance.additionalInsets.left)
         
-        return UIEdgeInsets(top: appearance.additionalInsets.top,
-                            left: sideInset + appearance.additionalInsets.left,
-                            bottom: appearance.additionalInsets.bottom,
-                            right: sideInset + appearance.additionalInsets.right)
+        return UIEdgeInsets(top: appearance.additionalInsets.top.rounded(),
+                            left: actualSideInset.rounded(),
+                            bottom: appearance.additionalInsets.bottom.rounded(),
+                            right: actualSideInset.rounded())
     }
     
     /// Returns the item which is closest to the center
     public var centerItemIndex: Int? {
-        return snappedItemIndex(forCenterOffset: scrollView.contentOffset.x + scrollView.bounds.width / 2)
+        return actualCenterItemIndex.flatMap { $0 % (itemFrames.count / infiniteMultiplier) }
     }
     
     public var snapBehavior: SnapBehavior = .default
     
-    public var visibleItems: [VisibleItem] = []
+    public private(set) var visibleItems: [VisibleItem] = []
     
     public override init(frame: CGRect) {
         super.init(frame: frame)
@@ -122,12 +139,12 @@ public final class CarouselView: UIView {
     
     public func reloadData() {
         // if snap behavior was on, store currently centered item to restore it after data reload
-        let centerItemIndex: Int? = (snapBehavior != .none) ? self.centerItemIndex : nil
+        let actualCenterItemIndex: Int? = (snapBehavior != .none) ? self.actualCenterItemIndex : nil
         
         contentView.subviews.forEach { removeView($0) }
 
         calculateItemFrames()
-        contentWidthConstraint.constant = getApproximateContentRect().width
+        contentWidthConstraint.constant = getContentRect().width
         
         let items = addItems()
         self.visibleItems = items
@@ -135,25 +152,79 @@ public final class CarouselView: UIView {
         layoutIfNeeded()
         updateTransforms()
         
-        if let centerItemIndex = centerItemIndex {
-            scrollToItem(at: centerItemIndex, animated: false)
+        updateInfiniteScrollOffset()
+        
+        if let actualCenterItemIndex = actualCenterItemIndex {
+            scrollToIndex(actualCenterItemIndex, animated: false)
         }
     }
     
     public func scrollToItem(at index: Int, animated: Bool = true) {
-        guard itemFrames.indices.contains(index) else { return }
+        let actualCount = itemFrames.count / infiniteMultiplier
+        guard actualCount > index else { return }
         
-        let offset = itemFrames[index].midX - (scrollView.bounds.width / 2)
-        scrollView.setContentOffset(CGPoint(x: offset,
-                                            y: 0), animated: animated)
+        let closestIndex = (1...infiniteMultiplier)
+            .map { $0 * index }
+            .min { abs($0 - index) < abs($1 - index) }!
+        
+        scrollToIndex(closestIndex, animated: animated)
+    }
+    
+    public func updateAppearance(_ updateClosure: (inout Appearance) -> Void) {
+        reloadDataOnAppearanceUpdate = false
+        updateClosure(&appearance)
+        reloadDataOnAppearanceUpdate = true
+        reloadData()
+    }
+    
+    // MARK: - Internal
+    
+    var centerItemSize: CGSize {
+        guard scrollView.visibleSize.width > 0 else { return .zero }
+        
+        let height = scrollView.visibleSize.height - appearance.additionalInsets.top - appearance.additionalInsets.bottom
+        
+        let width: CGFloat
+        switch appearance.centerItemWidth {
+        case .contentWidthRatio(let ratio):
+            width = (ratio * scrollView.visibleSize.width).rounded()
+        case .heightRatio(let ratio):
+            width = (height * ratio).rounded()
+        }
+        
+        return CGSize(width: width, height: height)
+    }
+    
+    func getSpacing(betweenItemsWithSizeRatios ratios: [CGFloat] = []) -> CGFloat {
+        return appearance.itemSpacing - ratios.reduce(0) { result, ratio in
+            return result + (centerItemSize.width * (1 - ratio)) / 2
+        }.rounded()
+    }
+    
+    var sideItemSpacing: CGFloat {
+        return getSpacing(betweenItemsWithSizeRatios: [1, appearance.sideItemTransform.sizeRatio])
     }
     
     // MARK: - Private
+    
+    private var reloadDataOnAppearanceUpdate = true
     
     private let scrollView = UIScrollView()
     private let contentView = UIView()
     private var contentWidthConstraint: NSLayoutConstraint!
     private var itemFrames: [CGRect] = []
+    
+    private var infiniteMultiplier: Int { return isInfinite ? 3 : 1 }
+    
+    public var actualCenterItemIndex: Int? {
+        return actualSnappedItemIndex(forCenterOffset: scrollView.contentOffset.x + scrollView.visibleSize.width / 2)
+    }
+    
+    private var realItemsCount: Int {
+        return itemFrames.count / infiniteMultiplier
+    }
+    
+    private var targetAnimationOffset: CGFloat?
     
     private func commonInit() {
         scrollView.backgroundColor = .clear
@@ -175,35 +246,25 @@ public final class CarouselView: UIView {
     }
     
     private func calculateItemFrames() {
+        layoutIfNeeded()
         itemFrames = dataSource.flatMap { calculateItemFrames(from: $0) } ?? []
     }
     
     private func calculateItemFrames(from dataSource: CarouselViewDataSource) -> [CGRect] {
-        layoutIfNeeded()
+        let itemsCount = dataSource.numberOfItems(in: self)
+        let actualCount = itemsCount * infiniteMultiplier
         
-        let count = dataSource.numberOfItems(in: self)
-        
-        // Treat all items as "small" ones by default
-        // actaully in this approach we only "enlarge" center item instead of transforming the other ones
-        let spacing = (appearance.itemSpacing / appearance.sideItemTransform.sizeRatio).rounded()
-        let itemWidth = (scrollView.visibleSize.width * appearance.centerItemWidthPercentage * appearance.sideItemTransform.sizeRatio).rounded()
-        
-        var insets = adjustedContentInset
-        insets.left = ((insets.left + appearance.itemSpacing) / appearance.sideItemTransform.sizeRatio).rounded()
-        insets.top = (insets.top / appearance.sideItemTransform.sizeRatio).rounded()
-        insets.bottom = (insets.bottom / appearance.sideItemTransform.sizeRatio).rounded()
-        
-        let itemFrames = (0..<count).map { itemIndex in
-            CGRect(x: (itemWidth + spacing) * CGFloat(itemIndex) + insets.left,
-                   y: 0,
-                   width: itemWidth,
-                   height: scrollView.visibleSize.height - insets.top - insets.bottom)
+        let itemFrames = (0..<actualCount).map { index -> CGRect in
+            return CGRect(x: (centerItemSize.width + sideItemSpacing) * CGFloat(index) + adjustedContentInset.left,
+                          y: 0,
+                          width: centerItemSize.width,
+                          height: centerItemSize.height)
         }
         
         return itemFrames
     }
     
-    private func getApproximateContentRect(from frames: [CGRect]? = nil) -> CGRect {
+    private func getContentRect(from frames: [CGRect]? = nil) -> CGRect {
         let frames = frames ?? itemFrames
         var contentBounds = frames.reduce(CGRect.zero) { result, rect in result.union(rect) }
         
@@ -213,24 +274,26 @@ public final class CarouselView: UIView {
         return contentBounds
     }
     
-    private func snappedItemIndex(forCenterOffset centerX: CGFloat) -> Int? {
+    private func actualSnappedItemIndex(forCenterOffset centerX: CGFloat) -> Int? {
+        guard !itemFrames.isEmpty else { return nil }
+        
         let distanceFromItems = itemFrames.map { abs($0.midX - centerX) }
         return distanceFromItems
             .enumerated()
-            .min { $0.element < $1.element }?
+            .min { $0.element < $1.element }!
             .offset
     }
     
-    private func snappedContentOffset(forCenterOffset centerX: CGFloat) -> CGFloat {
+    private func actualSnappedContentOffset(forCenterOffset centerX: CGFloat) -> CGFloat {
         let targetCenterX: CGFloat
         
-        if let closestIndex = snappedItemIndex(forCenterOffset: centerX) {
+        if let closestIndex = actualSnappedItemIndex(forCenterOffset: centerX) {
             targetCenterX = itemFrames[closestIndex].midX
         } else {
             targetCenterX = centerX
         }
         
-        return targetCenterX - (scrollView.bounds.width / 2)
+        return targetCenterX - (scrollView.visibleSize.width / 2)
     }
     
     private func getVisibleItemIndices(from frames: [CGRect]? = nil) -> [Int] {
@@ -245,19 +308,23 @@ public final class CarouselView: UIView {
         return visibleItemIndices
     }
     
-    private func addItems(at indices: [Int]? = nil) -> [VisibleItem] {
+    private func addItems(at actualIndices: [Int]? = nil) -> [VisibleItem] {
         guard let dataSource = dataSource else { return [] }
         
-        let indices = indices ?? getVisibleItemIndices()
+        let indices = actualIndices ?? getVisibleItemIndices()
         var result: [VisibleItem] = []
         
-        let items = indices.map { (index: $0, view: dataSource.carouselView(self, cellForItemAt: $0)) }
+        let items = indices.map { actualIndex -> (index: Int, view: UIView) in
+            return (index: actualIndex,
+                    view: dataSource.carouselView(self,
+                                                  cellForItemAt: getRealIndex(forActualIndex: actualIndex)))
+        }
         
-        for (index, view) in items {
-            let frame = itemFrames[index]
+        for (actualIndex, view) in items {
+            let frame = itemFrames[actualIndex]
             
             let recognizer = UITapGestureRecognizer(target: self, action: #selector(itemTapped))
-            recognizer.name = "carouselView#tapRecognizer#\(index)"
+            recognizer.name = "carouselView#tapRecognizer#\(actualIndex)"
             recognizer.delegate = self
             view.addGestureRecognizer(recognizer)
             
@@ -274,7 +341,9 @@ public final class CarouselView: UIView {
             
             NSLayoutConstraint.activate([left, top, width, height])
             
-            result.append(VisibleItem(index: index, view: view))
+            result.append(VisibleItem(index: getRealIndex(forActualIndex: actualIndex),
+                                      actualIndex: actualIndex,
+                                      view: view))
         }
         
         contentView.layoutIfNeeded()
@@ -297,41 +366,33 @@ public final class CarouselView: UIView {
     
     @objc private func itemTapped(_ recognizer: UITapGestureRecognizer) {
         guard let itemIndex = recognizer.name?.components(separatedBy: "#").last.flatMap(Int.init) else { return }
-        delegate?.carouselView(self, didSelectItemAt: itemIndex)
+        delegate?.carouselView(self,
+                               didSelectItemAt: getRealIndex(forActualIndex: itemIndex))
     }
     
     private func updateVisibleItems() {
         let visibleItemIndices = getVisibleItemIndices()
-        guard Set(visibleItemIndices) != Set(self.visibleItems.map(\.index)) else { return }
+        guard Set(visibleItemIndices) != Set(self.visibleItems.map(\.actualIndex)) else { return }
         
-        let itemsToRemove = self.visibleItems.filter { !visibleItemIndices.contains($0.index) }
-        let indicesToRemove = itemsToRemove.map(\.index)
-        let indicesToAdd = visibleItemIndices.filter { idx in !self.visibleItems.contains { $0.index == idx } }
+        let itemsToRemove = self.visibleItems.filter { !visibleItemIndices.contains($0.actualIndex) }
+        let indicesToRemove = itemsToRemove.map(\.actualIndex)
+        let indicesToAdd = visibleItemIndices.filter { idx in !self.visibleItems.contains { $0.actualIndex == idx } }
         
         itemsToRemove.compactMap(\.view).forEach { removeView($0) }
-        let remainingItems = self.visibleItems.filter { !indicesToRemove.contains($0.index) }
+        let remainingItems = self.visibleItems.filter { !indicesToRemove.contains($0.actualIndex) }
         let addedItems = addItems(at: indicesToAdd)
         
         self.visibleItems = (remainingItems + addedItems).sorted { $0.index < $1.index }
     }
     
     private func updateTransforms() {
-        guard let itemSize = itemFrames.first?.size else { return }
+        guard !visibleItems.isEmpty else { return }
         
         let centerOffset = scrollView.contentOffset.x + (scrollView.visibleSize.width / 2)
+        let sideItemDistance = (centerItemSize.width / 2) + sideItemSpacing + (centerItemSize.width * appearance.sideItemTransform.sizeRatio / 2)
         
-        let offscreenDistance = (scrollView.bounds.width / 2) + (itemSize.width / 2)
-        let sideItemDistance = (scrollView.bounds.width * appearance.centerItemWidthPercentage / 2) + appearance.itemSpacing + itemSize.width / 2
-        let sideToOffscreenRatio = sideItemDistance / offscreenDistance
-        
+        let centerTransform = TransformValues.identity
         let sideItemTransform = TransformValues(appearance.sideItemTransform)
-        let centerTransform = TransformValues(alpha: 1,
-                                              xScale: 1/sideItemTransform.xScale,
-                                              yScale: 1/sideItemTransform.yScale)
-        
-        let edgeTransform = TransformValues(alpha: sideItemTransform.alpha * sideToOffscreenRatio,
-                                            xScale: sideItemTransform.xScale * sideToOffscreenRatio,
-                                            yScale: sideItemTransform.yScale * sideToOffscreenRatio)
         
         // bring centermost items to front
         visibleItems
@@ -339,20 +400,86 @@ public final class CarouselView: UIView {
             .sorted { abs(centerOffset -  $0.frame.midX) > abs(centerOffset -  $1.frame.midX) }
             .forEach { contentView.bringSubviewToFront($0) }
         
-        visibleItems.enumerated().forEach { (index, item) in
-            guard let view = item.view else { return }
+        let transforms = visibleItems.map { item -> TransformData in
+            guard let view = item.view else { return .zero }
             
             let distanceFromCenter = centerOffset - view.frame.midX
-            let distanceRatio = abs(distanceFromCenter) / offscreenDistance
+            let distanceRatio = abs(distanceFromCenter) / sideItemDistance
             
-            let transform = TransformValues.get(from: centerTransform,
-                                                to: edgeTransform,
-                                                progress: distanceRatio)
+            let values = TransformValues.get(from: centerTransform,
+                                             to: sideItemTransform,
+                                             progress: distanceRatio)
             
-            view.alpha = transform.alpha
-            view.transform = CGAffineTransform(scaleX: transform.xScale,
-                                               y: transform.yScale)
+            return TransformData(values: values, distanceFromCenter: distanceFromCenter)
         }
+        
+        visibleItems.indices.forEach { index in
+            let item = visibleItems[index]
+            let transform = transforms[index]
+            guard let view = item.view else { return }
+            
+            // bring further side elements closer to the center
+            // due to spacing being calculated for side item only by default
+            let distanceSign: CGFloat = (transform.distanceFromCenter >= 0) ? 1 : -1
+            let scaleDiff = max(appearance.sideItemTransform.sizeRatio - transform.values.xScale, 0)
+            let sideItemWidth = centerItemSize.width * appearance.sideItemTransform.sizeRatio
+            let xTransformCompensation = scaleDiff * (sideItemWidth + appearance.itemSpacing) * distanceSign
+            
+            view.alpha = transform.values.alpha
+            view.transform = CGAffineTransform(translationX: xTransformCompensation, y: 0)
+                .scaledBy(x: transform.values.xScale, y: transform.values.yScale)
+        }
+    }
+    
+    private func scrollToIndex(_ index: Int, animated: Bool = true) {
+        guard itemFrames.indices.contains(index) else { return }
+        
+        let offset = itemFrames[index].midX - (scrollView.visibleSize.width / 2)
+        scrollView.setContentOffset(CGPoint(x: offset,
+                                            y: 0), animated: animated)
+    }
+    
+    private func updateInfiniteScrollOffset() {
+        guard isInfinite else { return }
+        
+        let offset = getScrollOffset(for: scrollView.contentOffset.x)
+        
+        if offset != scrollView.contentOffset.x {
+            scrollView.setContentOffset(CGPoint(x: offset, y: 0), animated: false)
+        }
+    }
+    
+    private func snapToClosestItem(animated: Bool = true) {
+        guard let index = actualCenterItemIndex else { return }
+        scrollToIndex(index, animated: animated)
+    }
+    
+    private func getScrollOffset(for offset: CGFloat) -> CGFloat {
+        guard isInfinite else { return offset }
+        
+        let midSectionIndex = (infiniteMultiplier - 1) / 2
+        let sectionsRange = 0...(infiniteMultiplier - 1)
+        
+        let sectionSize = scrollView.contentSize.width / CGFloat(infiniteMultiplier)
+        
+        let offsetRanges = sectionsRange
+            .map { sectionIndex in
+                (CGFloat(sectionIndex) * sectionSize)...(CGFloat(sectionIndex + 1) * sectionSize)
+            }
+        
+        let midRange = offsetRanges[midSectionIndex]
+        
+        var offset = offset
+        while !midRange.contains(offset) {
+            if offset < midRange.lowerBound { offset += sectionSize }
+            if offset > midRange.upperBound { offset -= sectionSize }
+        }
+        
+        return offset
+    }
+    
+    private func getRealIndex(forActualIndex index: Int) -> Int {
+        return index % realItemsCount
     }
 }
 
@@ -362,14 +489,37 @@ extension CarouselView: UIScrollViewDelegate {
         updateTransforms()
         
         delegate?.carouselView(self, didScrollToOffset: scrollView.contentOffset.x)
+        
+        if scrollView.isCloseToContentEdge {
+            let targetOffset = targetAnimationOffset
+            let oldOffset = scrollView.contentOffset.x
+            updateInfiniteScrollOffset()
+            
+            if let targetOffset = targetOffset {
+                let offsetDiff = targetOffset - oldOffset
+                let offset = scrollView.contentOffset.x + offsetDiff
+                scrollView.setContentOffset(CGPoint(x: offset, y: 0), animated: true)
+                targetAnimationOffset = nil
+            }
+        }
+    }
+    
+    public func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+        updateInfiniteScrollOffset()
     }
     
     public func scrollViewWillEndDragging(_ scrollView: UIScrollView, withVelocity velocity: CGPoint, targetContentOffset: UnsafeMutablePointer<CGPoint>) {
+        let offsetRange = (0...(scrollView.contentSize.width - scrollView.visibleSize.width))
+        let targetOffset = targetContentOffset.pointee.x
+        let isTargetInContent = offsetRange.contains(targetOffset)
+        
+        guard isInfinite || isTargetInContent else { return }
+        
         func index(offsetBy value: Int) -> Int? {
             let velocityCompensation = -velocity.x * 50
-            let offset = scrollView.contentOffset.x + (scrollView.bounds.width / 2) + velocityCompensation
+            let offset = scrollView.contentOffset.x + (scrollView.visibleSize.width / 2) + velocityCompensation
             
-            guard let centerIndex = snappedItemIndex(forCenterOffset: offset),
+            guard let centerIndex = actualSnappedItemIndex(forCenterOffset: offset),
                   case let targetIndex = centerIndex + value,
                   itemFrames.indices.contains(targetIndex) else { return nil }
             
@@ -380,7 +530,7 @@ extension CarouselView: UIScrollViewDelegate {
         let referenceOffset: CGFloat
         switch snapBehavior {
         case .soft:
-            referenceOffset = targetContentOffset.pointee.x + scrollView.bounds.width / 2
+            referenceOffset = targetOffset + scrollView.visibleSize.width / 2
         case .hard:
             let sign: FloatingPointSign? = (velocity.x != 0 ? velocity.x.sign : nil)
             let targetIndex: Int?
@@ -394,18 +544,30 @@ extension CarouselView: UIScrollViewDelegate {
             if let targetIndex = targetIndex {
                 referenceOffset = itemCenters[targetIndex]
             } else {
-                referenceOffset = scrollView.contentOffset.x + scrollView.bounds.width / 2
+                referenceOffset = scrollView.contentOffset.x + scrollView.visibleSize.width / 2
             }
         case .none:
             return
         }
         
-        let snappedOffset = snappedContentOffset(forCenterOffset: referenceOffset)
-        targetContentOffset.pointee = CGPoint(x: snappedOffset, y: 0)
+        let actualSnappedOffset = actualSnappedContentOffset(forCenterOffset: referenceOffset)
+        targetContentOffset.pointee = CGPoint(x: actualSnappedOffset, y: 0)
+        targetAnimationOffset = actualSnappedOffset
         
-        if let snappedItemIndex = snappedItemIndex(forCenterOffset: referenceOffset) {
-            delegate?.carouselView(self, willSnapToItemAt: snappedItemIndex)
+        if let snappedItemIndex = actualSnappedItemIndex(forCenterOffset: referenceOffset) {
+            let realIndex = getRealIndex(forActualIndex: snappedItemIndex)
+            delegate?.carouselView(self, willSnapToItemAt: realIndex)
         }
+    }
+    
+    public func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+        updateInfiniteScrollOffset()
+
+        if snapBehavior != .none {
+            snapToClosestItem()
+        }
+        
+        targetAnimationOffset = nil
     }
 }
 
@@ -432,7 +594,16 @@ private struct EdgeConstraints {
     let bottom: NSLayoutConstraint
 }
 
+private struct TransformData {
+    static let zero = TransformData(values: .identity, distanceFromCenter: 0)
+    
+    let values: TransformValues
+    let distanceFromCenter: CGFloat
+}
+
 private struct TransformValues {
+    static let identity = TransformValues(alpha: 1, xScale: 1, yScale: 1)
+    
     internal init(alpha: CGFloat, xScale: CGFloat, yScale: CGFloat) {
         self.alpha = alpha
         self.xScale = xScale
@@ -442,7 +613,7 @@ private struct TransformValues {
     init(_ transform: CarouselView.Transform) {
         self.alpha = transform.alpha
         self.xScale = transform.sizeRatio
-        self.yScale = 1
+        self.yScale = transform.sizeRatio
     }
     
     let alpha: CGFloat
@@ -467,5 +638,24 @@ private struct TransformValues {
 extension CarouselView: UIGestureRecognizerDelegate {
     public func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
         return true
+    }
+}
+
+private extension UIScrollView {
+    var isCloseToContentEdge: Bool {
+        let minDistanceToEdge: CGFloat = 40
+        let isCloseToEdge = (contentOffset.x <= minDistanceToEdge || contentOffset.x >= (contentSize.width - bounds.size.width - minDistanceToEdge))
+        
+        return isCloseToEdge
+    }
+}
+
+public extension CarouselView.CenterItemWidth {
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        switch (lhs, rhs) {
+        case (.contentWidthRatio(let valA), .contentWidthRatio(let valB)): return valA == valB
+        case (.heightRatio(let valA), .heightRatio(let valB)): return valA == valB
+        default: return false
+        }
     }
 }
