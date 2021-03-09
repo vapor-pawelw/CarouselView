@@ -146,6 +146,7 @@ public final class CarouselView: UIView {
         calculateItemFrames()
         contentWidthConstraint.constant = getContentRect().width
         
+        removeAllItems()
         let items = addItems()
         self.visibleItems = items
         
@@ -308,6 +309,10 @@ public final class CarouselView: UIView {
         return visibleItemIndices
     }
     
+    private func removeAllItems() {
+        visibleItems.map(\.view).forEach { removeView($0) }
+    }
+    
     private func addItems(at actualIndices: [Int]? = nil) -> [VisibleItem] {
         guard let dataSource = dataSource else { return [] }
         
@@ -327,6 +332,7 @@ public final class CarouselView: UIView {
             recognizer.name = "carouselView#tapRecognizer#\(actualIndex)"
             recognizer.delegate = self
             view.addGestureRecognizer(recognizer)
+            view.tag = actualIndex
             
             contentView.addSubview(view)
             view.translatesAutoresizingMaskIntoConstraints = false

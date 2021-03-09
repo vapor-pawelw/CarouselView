@@ -24,7 +24,6 @@ class ViewController: UIViewController {
         carouselView.dataSource = self
         carouselView.delegate = self
         
-        carouselView.isInfinite = false
         carouselView.snapBehavior = .soft
         carouselView.updateAppearance { appearance in
             appearance.sideItemTransform.alpha = 0.8
